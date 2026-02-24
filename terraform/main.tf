@@ -14,6 +14,7 @@ resource "aws_vpc" "main" {
 
 resource "aws_subnet" "main" {
   count = 2
+
   vpc_id                  = aws_vpc.main.id
   cidr_block              = cidrsubnet(aws_vpc.main.cidr_block, 8, count.index)
   availability_zone       = element(["ap-south-1a", "ap-south-1b"], count.index)
@@ -72,10 +73,10 @@ resource "aws_security_group" "node_sg" {
   vpc_id = aws_vpc.main.id
 
   ingress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"] # Lab only
   }
 
   egress {
@@ -150,13 +151,29 @@ resource "aws_iam_role_policy_attachment" "node_ebs_policy" {
 # ---------------- EKS CLUSTER ----------------
 
 resource "aws_eks_cluster" "main" {
-  name     = "${var.project_name}-cluster"
+  name     = var.project_name
   role_arn = aws_iam_role.cluster_role.arn
 
   vpc_config {
     subnet_ids         = aws_subnet.main[*].id
     security_group_ids = [aws_security_group.cluster_sg.id]
   }
+}
+
+# ---------------- OIDC PROVIDER ----------------
+
+data "tls_certificate" "eks" {
+  url = aws_eks_cluster.main.identity[0].oidc[0].issuer
+}
+
+resource "aws_iam_openid_connect_provider" "eks" {
+  url = aws_eks_cluster.main.identity[0].oidc[0].issuer
+
+  client_id_list = ["sts.amazonaws.com"]
+
+  thumbprint_list = [
+    data.tls_certificate.eks.certificates[0].sha1_fingerprint
+  ]
 }
 
 # ---------------- NODE GROUP ----------------
@@ -176,27 +193,12 @@ resource "aws_eks_node_group" "main" {
   instance_types = ["t3.medium"]
 
   remote_access {
-    ec2_ssh_key = var.ssh_key_name
+    ec2_ssh_key               = var.ssh_key_name
     source_security_group_ids = [aws_security_group.node_sg.id]
   }
 }
 
 # ---------------- EBS CSI ADDON ----------------
-
-resource "aws_eks_addon" "ebs_csi_driver" {
-  cluster_name             = aws_eks_cluster.deepak.name
-  addon_name               = "aws-ebs-csi-driver"
-  resolve_conflicts_on_create = "OVERWRITE"
-  resolve_conflicts_on_update = "OVERWRITE"
-
-  service_account_role_arn = aws_iam_role.ebs_csi_role.arn
-}
-
-resource "aws_iam_role" "ebs_csi_role" {
-  name = "deepak-eks-ebs-csi-role"
-
-  assume_role_policy = data.aws_iam_policy_document.ebs_assume_role_policy.json
-}
 
 data "aws_iam_policy_document" "ebs_assume_role_policy" {
   statement {
@@ -209,12 +211,28 @@ data "aws_iam_policy_document" "ebs_assume_role_policy" {
 
     condition {
       test     = "StringEquals"
-      variable = "${replace(aws_eks_cluster.deepak.identity[0].oidc[0].issuer, "https://", "")}:sub"
+      variable = "${replace(aws_eks_cluster.main.identity[0].oidc[0].issuer, "https://", "")}:sub"
       values   = ["system:serviceaccount:kube-system:ebs-csi-controller-sa"]
     }
   }
 }
+
+resource "aws_iam_role" "ebs_csi_role" {
+  name = "${var.project_name}-ebs-csi-role"
+
+  assume_role_policy = data.aws_iam_policy_document.ebs_assume_role_policy.json
+}
+
 resource "aws_iam_role_policy_attachment" "ebs_csi_policy" {
   role       = aws_iam_role.ebs_csi_role.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy"
+}
+
+resource "aws_eks_addon" "ebs_csi_driver" {
+  cluster_name             = aws_eks_cluster.main.name
+  addon_name               = "aws-ebs-csi-driver"
+  resolve_conflicts_on_create = "OVERWRITE"
+  resolve_conflicts_on_update = "OVERWRITE"
+
+  service_account_role_arn = aws_iam_role.ebs_csi_role.arn
 }
